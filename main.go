@@ -5,36 +5,43 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"gobangSercice/middleware"
 	_ "gobangSercice/model"
+	"log"
 	"net/http"
 )
-
-//func init()  {
-//	err := model.RedisInit()
-//	if err != nil {
-//		panic(err.Error())
-//	}
-//}
 
 type connection struct {
 	ws *websocket.Conn
 
-	send chan []byte
-
-	h *hup
+	role uint8
 }
 
-type hup struct {
-	connections map[*connection]bool
+var Users []*connection
+
+var currentRoleStatus = map[string]bool{
+	"white": false,
+	"black": false,
 }
+
+var currentRound = 0
 
 type piecePoint struct {
-	x     int
-	y     int
-	color int
+	X     int `json:"x"`
+	Y     int `json:"y"`
+	Color int `json:"color"`
+	Role  int `json:"role"`
 }
 
-var pieceData = make([]*piecePoint, 10)
+type Message struct {
+	Code  uint8       `json:"code"`
+	Role  uint8       `json:"role"`
+	Round int         `json:"round"`
+	Msg   string      `json:"msg"`
+	Data  interface{} `json:"data"`
+}
+
+var pieceData = make([]*piecePoint, 0)
 
 var upGrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -55,6 +62,13 @@ func ping(c *gin.Context) {
 		}
 	}(ws)
 
+	link := &connection{
+		ws:   ws,
+		role: assigningRoles(),
+	}
+
+	Users = append(Users, link)
+
 	for {
 		// 读取数据
 		mt, message, err := ws.ReadMessage()
@@ -63,48 +77,152 @@ func ping(c *gin.Context) {
 		}
 
 		if string(message) == "ping" {
-			message = []byte("pong")
-			err = ws.WriteMessage(mt, message)
+
+			for i := 0; i < len(Users); i++ {
+
+				msg := Message{
+					Code:  1,
+					Role:  Users[i].role,
+					Msg:   getUserStatus(),
+					Round: currentRound,
+					Data:  pieceData,
+				}
+				content, err := json.Marshal(msg)
+				if err != nil {
+					log.Println(err.Error())
+					break
+				}
+
+				err = Users[i].ws.WriteMessage(mt, content)
+				if err != nil {
+					// 客户端退出了socket
+					role := Users[i].role
+					switch role {
+					case 1:
+						currentRoleStatus["white"] = false
+					case 2:
+						currentRoleStatus["black"] = false
+					}
+					Users = append(Users[:i], Users[i+1:]...)
+					fmt.Println(err)
+					break
+				}
+			}
+
+		} else {
+
+			point := &piecePoint{}
+
+			err = json.Unmarshal(message, point)
+
+			//currentRound = point.Color
+
 			if err != nil {
+				log.Println(err.Error())
 				break
 			}
-			break
-		}
 
-		point := &piecePoint{}
+			pieceData = append(pieceData, point)
 
-		err = json.Unmarshal(message, point)
-		if err != nil {
-			panic(err)
-			//log.Println(err.Error())
-			//break
-		}
+			editCurrentRound(point.Color)
 
-		pieceData = append(pieceData, point)
+			for i := 0; i < len(Users); i++ {
+				msg := Message{
+					Code:  0,
+					Role:  Users[i].role,
+					Msg:   getUserStatus(),
+					Round: currentRound,
+					Data:  pieceData,
+				}
+				content, err := json.Marshal(msg)
+				if err != nil {
+					log.Println(err.Error())
+					break
+				}
 
-		content, err := json.Marshal(pieceData)
-		if err != nil {
-			panic(err)
-			//log.Println(err.Error())
-			//break
-		}
+				err = Users[i].ws.WriteMessage(mt, content)
+				if err != nil {
+					// 客户端退出了socket
+					role := Users[i].role
+					switch role {
+					case 1:
+						currentRoleStatus["white"] = false
+					case 2:
+						currentRoleStatus["black"] = false
+					}
+					Users = append(Users[:i], Users[i+1:]...)
+					fmt.Println(err)
+					break
+				}
+			}
 
-		fmt.Println(content)
-
-		err = ws.WriteMessage(mt, content)
-		if err != nil {
-			break
 		}
 	}
+}
+
+func editCurrentRound(role int) {
+	//fmt.Println("-----")
+	//fmt.Println(role)
+	if role == 1 {
+		currentRound = 2
+	} else {
+		currentRound = 1
+	}
+}
+
+func getUserStatus() string {
+	if !currentRoleStatus["white"] && !currentRoleStatus["black"] {
+		return "游戏结束"
+	} else if !currentRoleStatus["black"] {
+		return "黑方已经退出游戏或未加入请等待"
+	} else if !currentRoleStatus["white"] {
+		return "白方已经退出游戏或未加入请等待"
+	}
+	return ""
+}
+
+// 分配角色 1白 2黑 3观众
+func assigningRoles() uint8 {
+	if len(Users) == 0 {
+		currentRoleStatus["white"] = true
+		return 1
+	}
+	if currentRoleStatus["white"] && !currentRoleStatus["black"] {
+		currentRoleStatus["black"] = true
+		currentRound = 1
+		return 2
+	}
+	return 3
 }
 
 func main() {
 	r := gin.Default()
 
+	r.Use(middleware.Cors())
+
 	r.GET("/ping", ping)
 
-	err := r.Run("127.0.0.1:8888")
+	r.GET("/refresh", Refresh)
+
+	err := r.Run("0.0.0.0:8881")
 	if err != nil {
 		return
 	}
+}
+
+func Refresh(context *gin.Context) {
+	pwd := context.DefaultQuery("pwd", "")
+
+	if pwd == "888888" {
+		currentRoleStatus["black"] = false
+		currentRoleStatus["white"] = false
+
+		pieceData = pieceData[0:0]
+		currentRound = 0
+		Users = Users[0:0]
+	}
+
+	context.JSON(http.StatusOK, gin.H{
+		"msg": pwd,
+	})
 }
